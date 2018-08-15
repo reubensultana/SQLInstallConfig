@@ -166,7 +166,7 @@ SET @PhysicalMemoryAvailable = (SELECT CAST([Internal_Value] AS int) FROM #msver
 -- Reserve 1 GB of RAM for the OS, 
 SET @OSReservedMemory = 1024;
 
--- 1 GB for each 4 GB of RAM installed from 4–16 GB, 
+-- 1 GB for each 4 GB of RAM installed from 4â€“16 GB, 
 IF (@PhysicalMemoryAvailable BETWEEN 4096 AND 16384)
     SET @OSReservedMemory = @OSReservedMemory + (1024 * ((@PhysicalMemoryAvailable - 4096) / 4096))
 
@@ -838,140 +838,147 @@ PRINT '';
 /* ************************************************** */
 -- 010_reconfigure_tempdb
 PRINT 'Reconfigure TEMPDB';
--- Modify properties of main tempdb file (NOTE: the properties here will be used to create additional tempdb files)
-PRINT '  Modify properties of main tempdb file';
 
--- check if the destination drive has enough free space
-SET @device_directory = (SELECT physical_name FROM tempdb.sys.database_files WHERE [name] = 'tempdev' and [file_id] = 1);
--- verify drive letter
-IF EXISTS(SELECT 1 FROM #fixeddrives WHERE DriveLetter = LEFT(@device_directory, 1))
+-- added check to avoid reconfiguring tempdb for SQL Server 2016 and later versions - the installation does it for you; 
+-- a "cleaner" solution will be provided in due course
+IF (@ProductVersion < '13')
 BEGIN
-    -- current size
-    -- check if enough space
-	IF ((SELECT MBFree FROM #fixeddrives WHERE DriveLetter = LEFT(@device_directory, 1)) < 
-		    @TempDBDataFileSize)
-		PRINT '  ***** Not enough space to extend main TEMPDB data file *****';
-	ELSE
+	-- Modify properties of main tempdb file (NOTE: the properties here will be used to create additional tempdb files)
+	PRINT '  Modify properties of main tempdb file';
+
+	-- check if the destination drive has enough free space
+	SET @device_directory = (SELECT physical_name FROM tempdb.sys.database_files WHERE [name] = 'tempdev' and [file_id] = 1);
+	-- verify drive letter
+	IF EXISTS(SELECT 1 FROM #fixeddrives WHERE DriveLetter = LEFT(@device_directory, 1))
 	BEGIN
-        -- compare existing to new size
-        IF ((SELECT ([size]*8)/1024 FROM tempdb.sys.database_files WHERE [name] = 'tempdev' and [file_id] = 1) <=
-            @TempDBDataFileSize)
-        BEGIN
-		    SET @SqlCmd = N'USE [master];
+		-- current size
+		-- check if enough space
+		IF ((SELECT MBFree FROM #fixeddrives WHERE DriveLetter = LEFT(@device_directory, 1)) < 
+				@TempDBDataFileSize)
+			PRINT '  ***** Not enough space to extend main TEMPDB data file *****';
+		ELSE
+		BEGIN
+			-- compare existing to new size
+			IF ((SELECT ([size]*8)/1024 FROM tempdb.sys.database_files WHERE [name] = 'tempdev' and [file_id] = 1) <=
+				@TempDBDataFileSize)
+			BEGIN
+				SET @SqlCmd = N'USE [master];
 ALTER DATABASE [tempdb] 
     MODIFY FILE ( 
         NAME = N''tempdev'', 
         SIZE = ' + CAST(@TempDBDataFileSize AS varchar(10)) + N'MB);
 ';
-		    EXEC sp_executesql @SqlCmd;
-        END -- compare existing to new size
-        ELSE
-            PRINT '  ***** The existing TEMPDB primary data file is larger than the supplied size parameter *****';
-	END -- check if enough space
+				EXEC sp_executesql @SqlCmd;
+			END -- compare existing to new size
+			ELSE
+				PRINT '  ***** The existing TEMPDB primary data file is larger than the supplied size parameter *****';
+		END -- check if enough space
 
-    -- max size
-    -- check if enough space
-	IF ((SELECT MBFree FROM #fixeddrives WHERE DriveLetter = LEFT(@device_directory, 1)) < 
-		    @TempDBDataFileMaxSize)
-		PRINT '  ***** Not enough space for maximum TEMPDB data file size *****';
-	ELSE
-	BEGIN
-        -- compare existing to new size
-        IF ((SELECT ([size]*8)/1024 FROM tempdb.sys.database_files WHERE [name] = 'tempdev' and [file_id] = 1) <=
-            @TempDBDataFileMaxSize)
-        BEGIN
-		    SET @SqlCmd = N'USE [master];
+		-- max size
+		-- check if enough space
+		IF ((SELECT MBFree FROM #fixeddrives WHERE DriveLetter = LEFT(@device_directory, 1)) < 
+				@TempDBDataFileMaxSize)
+			PRINT '  ***** Not enough space for maximum TEMPDB data file size *****';
+		ELSE
+		BEGIN
+			-- compare existing to new size
+			IF ((SELECT ([size]*8)/1024 FROM tempdb.sys.database_files WHERE [name] = 'tempdev' and [file_id] = 1) <=
+				@TempDBDataFileMaxSize)
+			BEGIN
+				SET @SqlCmd = N'USE [master];
 ALTER DATABASE [tempdb] 
     MODIFY FILE ( 
         NAME = N''tempdev'', 
 		MAXSIZE = ' + CAST(@TempDBDataFileMaxSize AS varchar(10)) + N'MB ,
 		FILEGROWTH = 0);
 ';
-		    EXEC sp_executesql @SqlCmd;
-        END -- compare existing to new size
-        ELSE
-            PRINT '  ***** The existing TEMPDB primary data file is larger than the supplied maximum size parameter *****';
-	END -- check if enough space
-END -- verify drive letter
-
--- variables for dynamic tempdb properties
---DECLARE @device_directory nvarchar(1000);
-DECLARE @size int, @max_size int, @growth int, @is_percent_growth bit;
--- variables for CPU count and number of tempdb files
-DECLARE @ExtraFiles tinyint;
-DECLARE @FileNumber tinyint;
-
--- get values for dynamic tempdb properties
-SELECT 
-	@device_directory = SUBSTRING([physical_name], 1, CHARINDEX(N'tempdb.mdf', LOWER([physical_name])) - 1),
-	@size = ([size]*8), 
-    @max_size = (CASE [max_size] WHEN 0 THEN 0 WHEN -1 THEN -1 ELSE ([max_size]*8) END),
-    @growth = (CASE [growth] WHEN 0 THEN 0 ELSE (CASE [is_percent_growth] WHEN 0 THEN ([growth]*8) WHEN 1 THEN [growth] END) END),
-    @is_percent_growth = [is_percent_growth]
-FROM tempdb.sys.database_files WHERE [file_id] = 1;
-/*
-NOTE:
-If is_percent_growth = 0, growth increment is in units of 8-KB pages, rounded to the nearest 64 KB
-If is_percent_growth = 1, growth increment is expressed as a whole number percentage.
-*/
-
--- get values for Processor Count and number of tempdb files
--- check Engine Edition
-IF (@EngineEdition LIKE 'Developer%') OR
-   (@EngineEdition LIKE 'Enterprise%') OR
-   (@EngineEdition LIKE 'Business Intelligence%') OR
-   (@EngineEdition LIKE 'Standard%')
-BEGIN
-    -- Skipped for Express Editions - the maximum Processor Count that can be allocated is 1
-    SET @ExtraFiles = CONVERT(tinyint, (SELECT [Internal_Value] FROM #msver WHERE [Name] = 'ProcessorCount'));
-    -- set a maximum threshold of 8 tempdb files per system
-    IF @ExtraFiles > 8 SET @ExtraFiles = 8;
-    -- remove "1" from the value returned to cater for the default (existing) file
-    SET @ExtraFiles = @ExtraFiles - 1;
-	
-	-- check if the destination drive has enough free space
-    -- verify drive letter
-	IF EXISTS(SELECT 1 FROM #fixeddrives WHERE DriveLetter = LEFT(@device_directory, 1))
-	BEGIN
-        -- check if enough space
-		IF ((SELECT MBFree FROM #fixeddrives WHERE DriveLetter = LEFT(@device_directory, 1)) < 
-			(@TempDBDataFileSize * @ExtraFiles))
-		BEGIN
-			PRINT '  ***** Not enough space to create extra TEMPDB data files *****';
-			SET @ExtraFiles = 0;
+				EXEC sp_executesql @SqlCmd;
+			END -- compare existing to new size
+			ELSE
+				PRINT '  ***** The existing TEMPDB primary data file is larger than the supplied maximum size parameter *****';
 		END -- check if enough space
 	END -- verify drive letter
+
+	-- variables for dynamic tempdb properties
+	--DECLARE @device_directory nvarchar(1000);
+	DECLARE @size int, @max_size int, @growth int, @is_percent_growth bit;
+	-- variables for CPU count and number of tempdb files
+	DECLARE @ExtraFiles tinyint;
+	DECLARE @FileNumber tinyint;
+
+	-- get values for dynamic tempdb properties
+	SELECT 
+		@device_directory = SUBSTRING([physical_name], 1, CHARINDEX(N'tempdb.mdf', LOWER([physical_name])) - 1),
+		@size = ([size]*8), 
+		@max_size = (CASE [max_size] WHEN 0 THEN 0 WHEN -1 THEN -1 ELSE ([max_size]*8) END),
+		@growth = (CASE [growth] WHEN 0 THEN 0 ELSE (CASE [is_percent_growth] WHEN 0 THEN ([growth]*8) WHEN 1 THEN [growth] END) END),
+		@is_percent_growth = [is_percent_growth]
+	FROM tempdb.sys.database_files WHERE [file_id] = 1;
+	/*
+	NOTE:
+	If is_percent_growth = 0, growth increment is in units of 8-KB pages, rounded to the nearest 64 KB
+	If is_percent_growth = 1, growth increment is expressed as a whole number percentage.
+	*/
+
+
+	-- get values for Processor Count and number of tempdb files
+	-- check Engine Edition
+	IF (@EngineEdition LIKE 'Developer%') OR
+	   (@EngineEdition LIKE 'Enterprise%') OR
+	   (@EngineEdition LIKE 'Business Intelligence%') OR
+	   (@EngineEdition LIKE 'Standard%')
+	BEGIN
+		-- Skipped for Express Editions - the maximum Processor Count that can be allocated is 1
+		SET @ExtraFiles = CONVERT(tinyint, (SELECT [Internal_Value] FROM #msver WHERE [Name] = 'ProcessorCount'));
+		-- set a maximum threshold of 8 tempdb files per system
+		IF @ExtraFiles > 8 SET @ExtraFiles = 8;
+		-- remove "1" from the value returned to cater for the default (existing) file
+		SET @ExtraFiles = @ExtraFiles - 1;
 	
-    -- create additional files (if all conditions are met)
-	PRINT '  Create additional files';
-    IF (@ExtraFiles > 0)
-    BEGIN
-	    SET @FileNumber = 1;
-	    WHILE (@FileNumber <= @ExtraFiles)
-	    BEGIN
-		    -- check if file exists (...just in case!)
-            IF NOT EXISTS (
-                SELECT 1 FROM tempdb.sys.database_files WHERE [name] = 'tempdev_' + CAST(@FileNumber AS nvarchar(3)))
-            BEGIN
-			    SET @SqlCmd = N'
-    ALTER DATABASE [tempdb] 
-	    ADD FILE ( 
-		    NAME = N''tempdev_' + CAST(@FileNumber AS nvarchar(3)) + ''', 
-		    FILENAME = ''' + @device_directory + 'tempdb_' + CAST(@FileNumber AS nvarchar(3)) + N'.ndf'' , 
-		    SIZE = ' + CAST(@size AS nvarchar(50)) + N'KB, 
-		    MAXSIZE = ' + CASE WHEN @max_size = -1 THEN N'UNLIMITED' ELSE CAST(@max_size AS nvarchar(50)) + N'KB' END + N', 
-		    FILEGROWTH = ' + CAST(@growth AS nvarchar(50)) + CASE @is_percent_growth WHEN 0 THEN N'KB' ELSE N'%' END + N')';
-			    EXEC sp_executesql @SqlCmd;
-		    END
-		    SET @FileNumber = @FileNumber + 1;
-	    END -- WHILE LOOP
-    END -- check @ExtraFiles > 0
-END -- check Engine Edition
+		-- check if the destination drive has enough free space
+		-- verify drive letter
+		IF EXISTS(SELECT 1 FROM #fixeddrives WHERE DriveLetter = LEFT(@device_directory, 1))
+		BEGIN
+			-- check if enough space
+			IF ((SELECT MBFree FROM #fixeddrives WHERE DriveLetter = LEFT(@device_directory, 1)) < 
+				(@TempDBDataFileSize * @ExtraFiles))
+			BEGIN
+				PRINT '  ***** Not enough space to create extra TEMPDB data files *****';
+				SET @ExtraFiles = 0;
+			END -- check if enough space
+		END -- verify drive letter
+	
+		-- create additional files (if all conditions are met)
+		PRINT '  Create additional files';
+		IF (@ExtraFiles > 0)
+		BEGIN
+			SET @FileNumber = 1;
+			WHILE (@FileNumber <= @ExtraFiles)
+			BEGIN
+				-- check if file exists (...just in case!)
+				IF NOT EXISTS (
+					SELECT 1 FROM tempdb.sys.database_files WHERE [name] = 'tempdev_' + CAST(@FileNumber AS nvarchar(3)))
+				BEGIN
+					SET @SqlCmd = N'
+ALTER DATABASE [tempdb] 
+	ADD FILE ( 
+		NAME = N''tempdev_' + CAST(@FileNumber AS nvarchar(3)) + ''', 
+		FILENAME = ''' + @device_directory + 'tempdb_' + CAST(@FileNumber AS nvarchar(3)) + N'.ndf'' , 
+		SIZE = ' + CAST(@size AS nvarchar(50)) + N'KB, 
+		MAXSIZE = ' + CASE WHEN @max_size = -1 THEN N'UNLIMITED' ELSE CAST(@max_size AS nvarchar(50)) + N'KB' END + N', 
+		FILEGROWTH = ' + CAST(@growth AS nvarchar(50)) + CASE @is_percent_growth WHEN 0 THEN N'KB' ELSE N'%' END + N')';
+					EXEC sp_executesql @SqlCmd;
+				END
+				SET @FileNumber = @FileNumber + 1;
+			END -- WHILE LOOP
+		END -- check @ExtraFiles > 0
+	END -- check Engine Edition
+END
 
 -- modify tempdb LOG file
 PRINT '  Modify tempdb LOG file';
 -- shrink the log file
-SET @SqlCmd = N'USE [tempdb];DBCC SHRINKFILE (N''tempdev'' , 1024) WITH NO_INFOMSGS;'
+SET @SqlCmd = N'USE [tempdb];DBCC SHRINKFILE (N''templog'' , 1024) WITH NO_INFOMSGS;'
 EXEC sp_executesql @SqlCmd;
 -- check if the destination drive has enough free space
 SET @device_directory = (SELECT physical_name FROM tempdb.sys.database_files WHERE [name] = 'templog' and [file_id] = 2);
