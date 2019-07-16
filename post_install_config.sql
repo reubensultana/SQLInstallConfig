@@ -86,11 +86,15 @@ SET @EngineEdition = CAST(SERVERPROPERTY('Edition') AS nvarchar(128));
 DECLARE @IsClustered bit;
 SET @IsClustered = CAST(SERVERPROPERTY('IsClustered') AS bit);
 
+DECLARE @IsHadrEnabled bit;
+SET @IsHadrEnabled = CAST(SERVERPROPERTY('IsHadrEnabled') AS bit);
+
 PRINT '--------------------------------------------------------------------------------';
 PRINT 'Post-install configuration script running on ' + @InstanceName;
 PRINT 'Engine Edition           = ' + @EngineEdition;
 PRINT 'Product Version          = ' + @ProductVersion;
 PRINT 'Is Clustered             = ' + CASE @IsClustered WHEN 0 THEN 'No' WHEN 1 THEN 'Yes' ELSE 'N/A' END;
+PRINT 'Is HADR Enabled          = ' + CASE @IsHadrEnabled WHEN 0 THEN 'No' WHEN 1 THEN 'Yes' ELSE 'N/A' END;
 PRINT '================================================================================'
 PRINT 'Operator-defined variable values:';
 PRINT '  @NumberofInstances     = ' + CAST(@NumberofInstances AS varchar(15));
@@ -1269,7 +1273,7 @@ PRINT 'Limit the number of members in the sysadmin fixed server role';
 IF ((@ProductVersion LIKE '9.%') OR (@ProductVersion LIKE '10.%'))
 BEGIN
 	-- syntax for 2008 R2 and earlier versions
-    IF (@IsClustered = 0) -- only if not clustered - login is used as the Cluster Service start-up account
+    IF ((@IsClustered = 0) AND (@IsHadrEnabled = 0)) -- only if not clustered - login is used as the Cluster Service start-up account
     BEGIN
 	    PRINT '  Revoke membership to "NT AUTHORITY\SYSTEM"';
 	    IF (((SELECT TOP(1) 1 FROM sys.server_principals WHERE [name] = 'NT AUTHORITY\SYSTEM') = 1) AND (IS_SRVROLEMEMBER('sysadmin', 'NT AUTHORITY\SYSTEM') = 1))
@@ -1287,7 +1291,7 @@ BEGIN
 	PRINT '  Disable these accounts'
 	IF (@ProductVersion LIKE '10.%')
 	BEGIN
-        IF (@IsClustered = 0) -- only if not clustered - login is used as the Cluster Service start-up account
+        IF ((@IsClustered = 0) AND (@IsHadrEnabled = 0))-- only if not clustered - login is used as the Cluster Service start-up account
         BEGIN
             IF EXISTS(SELECT 1 FROM sys.server_principals WHERE [name] = 'NT AUTHORITY\SYSTEM')
 		        ALTER LOGIN [NT AUTHORITY\SYSTEM] DISABLE;
@@ -1301,7 +1305,7 @@ END
 ELSE
 BEGIN
 	-- syntax for 2012 and later versions
-	IF (@IsClustered = 0) -- only if not clustered - login is used as the Cluster Service start-up account
+	IF ((@IsClustered = 0) AND (@IsHadrEnabled = 0)) -- only if not clustered - login is used as the Cluster Service start-up account
     BEGIN
         PRINT '  Revoke membership to "NT AUTHORITY\SYSTEM"';
 	    IF (((SELECT TOP(1) 1 FROM sys.server_principals WHERE [name] = 'NT AUTHORITY\SYSTEM') = 1) AND (IS_SRVROLEMEMBER('sysadmin', 'NT AUTHORITY\SYSTEM') = 1))
@@ -1317,7 +1321,7 @@ BEGIN
 		EXEC sp_executesql N'USE [master];ALTER SERVER ROLE [sysadmin] DROP MEMBER [NT SERVICE\Winmgmt]';
 
 	PRINT '  Disable these accounts'
-	IF (@IsClustered = 0) -- only if not clustered - login is used as the Cluster Service start-up account
+	IF ((@IsClustered = 0) AND (@IsHadrEnabled = 0)) -- only if not clustered - login is used as the Cluster Service start-up account
     BEGIN
         IF EXISTS(SELECT 1 FROM sys.server_principals WHERE [name] = 'NT AUTHORITY\SYSTEM')
             ALTER LOGIN [NT AUTHORITY\SYSTEM] DISABLE;
