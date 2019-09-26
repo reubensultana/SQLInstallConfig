@@ -252,7 +252,7 @@ Database Engine edition of the instance of SQL Server installed on the server.
 5 = SQL Azure
 Base data type: int
 */
-PRINT 'Enabling "backup compression default" for Developer, Enterprise and Standard Editions only';
+PRINT 'Enabling "backup compression default" and "backup checksum default" for Developer, Enterprise and Standard Editions only';
 
 -- see http://msdn.microsoft.com/en-us/library/cc645993.aspx
 -- check Engine Edition
@@ -269,7 +269,21 @@ BEGIN
 		RECONFIGURE WITH OVERRIDE;
 	END
     ELSE
+    BEGIN
         PRINT 'Backup Compression option did not require reconfiguration';
+    END
+    
+    -- check current and set parameter values
+    IF (SELECT CAST(value_in_use AS int) FROM sys.configurations
+        WHERE [name] = 'backup checksum default') <> 1
+    BEGIN
+        EXEC sp_configure 'backup checksum default', 1;
+        RECONFIGURE WITH OVERRIDE;
+    END
+    ELSE
+    BEGIN
+        PRINT 'Backup Checksum option did not require reconfiguration';
+    END
 END -- check Engine Edition
 
 PRINT '';
