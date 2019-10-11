@@ -339,23 +339,27 @@ PRINT '';
 PRINT 'Deploying DBA Toolbox database';
 DECLARE @device_directory nvarchar(1000);
 DECLARE @compatibility_level int;
+DECLARE @default_datafolder nvarchar(1000);
+DECLARE @default_logfolder nvarchar(1000);
 SET @device_directory = (
 	SELECT SUBSTRING([physical_name], 1, CHARINDEX(N'master.mdf', LOWER([physical_name])) - 1)
 	FROM sys.master_files WHERE [database_id] = DB_ID('master') AND [file_id] = 1);
 SET @compatibility_level = (SELECT compatibility_level FROM sys.databases WHERE name = 'master');
+EXEC xp_instance_regread N'HKEY_LOCAL_MACHINE', N'Software\Microsoft\MSSQLServer\MSSQLServer', N'DefaultData', @default_datafolder OUTPUT;
+EXEC xp_instance_regread N'HKEY_LOCAL_MACHINE', N'Software\Microsoft\MSSQLServer\MSSQLServer', N'DefaultLog', @default_logfolder OUTPUT;
 	
 IF NOT EXISTS (SELECT name FROM sys.databases WHERE name = N'DBAToolbox')
 BEGIN
-	PRINT '  Creating database';
+    PRINT '  Creating database';
     SET @SqlCmd = N'USE [master];
 CREATE DATABASE [DBAToolbox] ON PRIMARY ( 
     NAME = N''DBAToolbox'', 
-    FILENAME = ''' + @device_directory + 'DBAToolbox.mdf'' , 
+    FILENAME = ''' + @default_datafolder + 'DBAToolbox.mdf'' , 
     SIZE = 5120KB , 
     FILEGROWTH = 1024KB )
 LOG ON ( 
     NAME = N''DBAToolbox_log'', 
-    FILENAME = ''' + @device_directory + 'DBAToolbox_log.ldf'' , 
+    FILENAME = ''' + @default_logfolder + 'DBAToolbox_log.ldf'' , 
     SIZE = 5120KB , 
     FILEGROWTH = 1024KB );';
 
@@ -365,11 +369,11 @@ LOG ON (
 
     ALTER DATABASE [DBAToolbox] SET RECOVERY SIMPLE;
 	
-	ALTER DATABASE [DBAToolbox] SET RESTRICTED_USER;
+    ALTER DATABASE [DBAToolbox] SET RESTRICTED_USER;
 
-	ALTER DATABASE [DBAToolbox] SET AUTO_CLOSE OFF WITH NO_WAIT;
+    ALTER DATABASE [DBAToolbox] SET AUTO_CLOSE OFF WITH NO_WAIT;
 
-	PRINT '  DBA Toolbox database created';
+    PRINT '  DBA Toolbox database created';
 END
 ELSE
     PRINT 'DBA Toolbox already deployed';
@@ -414,8 +418,8 @@ BEGIN
 
     SET @DBMailProfileName = 'SQL Server Email Notifications - ' + @InstanceName;
     SET @DBMailProfileDesc = 'Email notification service for SQL Server ' + @InstanceName;
-	PRINT '  Mail Profile Name = ' + @DBMailProfileName;
-	PRINT '  Mail Profile Desc = ' + @DBMailProfileDesc;
+    PRINT '  Mail Profile Name = ' + @DBMailProfileName;
+    PRINT '  Mail Profile Desc = ' + @DBMailProfileDesc;
 
     -- check if Service Broker is enabled on the MSDB database and prompt user
     IF NOT EXISTS (SELECT 1 FROM sys.databases WHERE [name] = 'msdb' AND [is_broker_enabled] = 1)
@@ -428,7 +432,7 @@ BEGIN
     -- check if the 'Database Mail XPs' configuration option is enabled and enable if not
     IF NOT EXISTS(SELECT 1 FROM sys.configurations WHERE [name] = 'Database Mail XPs' AND [value] = 1)
     BEGIN
-		PRINT '  Enabling "Database Mail XPs" option';
+        PRINT '  Enabling "Database Mail XPs" option';
         IF NOT EXISTS (SELECT 1 FROM sys.configurations WHERE [name] = 'show advanced options' AND [value] = 1)
         BEGIN
             EXEC sp_configure 'show advanced options', 1;
@@ -439,29 +443,29 @@ BEGIN
     END
 
     -- Create a Database Mail profile
-	PRINT '  Create a Database Mail profile';
+        PRINT '  Create a Database Mail profile';
 	IF NOT EXISTS(SELECT 1 FROM msdb.dbo.sysmail_profile WHERE [name] = @DBMailProfileName AND [description] = @DBMailProfileDesc)
 	BEGIN
-		EXECUTE msdb.dbo.sysmail_add_profile_sp
-			@profile_name = @DBMailProfileName,
-			@description = @DBMailProfileDesc;
+            EXECUTE msdb.dbo.sysmail_add_profile_sp
+                @profile_name = @DBMailProfileName,
+                @description = @DBMailProfileDesc;
 	END
     ELSE
         PRINT 'Database Mail Profile already created';
 	
     -- Create a Database Mail account
-	PRINT '  Create a Database Mail account';
-	IF NOT EXISTS(SELECT 1 FROM msdb.dbo.sysmail_account WHERE [name] = @AccountName AND [description] = @AccountName AND [email_address] = @AccountEmail)
+    PRINT '  Create a Database Mail account';
+    IF NOT EXISTS(SELECT 1 FROM msdb.dbo.sysmail_account WHERE [name] = @AccountName AND [description] = @AccountName AND [email_address] = @AccountEmail)
     BEGIN
-		EXECUTE msdb.dbo.sysmail_add_account_sp
-			@account_name = @AccountName,
-			@description = @AccountName,
-			@email_address = @AccountEmail,
-			@replyto_address = @AccountEmail,
-			@display_name = @DBMailProfileName,
-			@mailserver_name = @MailServer,
-			@port = @MailServerPort;
-	END
+        EXECUTE msdb.dbo.sysmail_add_account_sp
+            @account_name = @AccountName,
+            @description = @AccountName,
+            @email_address = @AccountEmail,
+            @replyto_address = @AccountEmail,
+            @display_name = @DBMailProfileName,
+            @mailserver_name = @MailServer,
+            @port = @MailServerPort;
+    END
     ELSE
         PRINT 'Database Mail Account already created';
 
