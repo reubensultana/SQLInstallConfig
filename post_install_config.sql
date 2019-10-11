@@ -89,12 +89,18 @@ SET @IsClustered = CAST(SERVERPROPERTY('IsClustered') AS bit);
 DECLARE @IsHadrEnabled bit;
 SET @IsHadrEnabled = CAST(SERVERPROPERTY('IsHadrEnabled') AS bit);
 
+DECLARE @HostPlatform nvarchar(256); -- Windows or Linux
+SET @HostPlatform = (SELECT TOP(1) host_platform FROM sys.dm_os_host_info);
+DECLARE @FolderSeparator nchar(1); -- "\" or "/"
+SET @FolderSeparator = CASE @HostPlatform WHEN 'Windows' THEN N'\' WHEN 'Linux' THEN N'/' END;
+
 PRINT '--------------------------------------------------------------------------------';
 PRINT 'Post-install configuration script running on ' + @InstanceName;
 PRINT 'Engine Edition           = ' + @EngineEdition;
 PRINT 'Product Version          = ' + @ProductVersion;
 PRINT 'Is Clustered             = ' + CASE @IsClustered WHEN 0 THEN 'No' WHEN 1 THEN 'Yes' ELSE 'N/A' END;
 PRINT 'Is HADR Enabled          = ' + CASE @IsHadrEnabled WHEN 0 THEN 'No' WHEN 1 THEN 'Yes' ELSE 'N/A' END;
+PRINT 'Host Platform            = ' + @HostPlatform;
 PRINT '================================================================================'
 PRINT 'Operator-defined variable values:';
 PRINT '  @NumberofInstances     = ' + CAST(@NumberofInstances AS varchar(15));
@@ -345,9 +351,22 @@ SET @device_directory = (
 	SELECT SUBSTRING([physical_name], 1, CHARINDEX(N'master.mdf', LOWER([physical_name])) - 1)
 	FROM sys.master_files WHERE [database_id] = DB_ID('master') AND [file_id] = 1);
 SET @compatibility_level = (SELECT compatibility_level FROM sys.databases WHERE name = 'master');
-EXEC xp_instance_regread N'HKEY_LOCAL_MACHINE', N'Software\Microsoft\MSSQLServer\MSSQLServer', N'DefaultData', @default_datafolder OUTPUT;
-EXEC xp_instance_regread N'HKEY_LOCAL_MACHINE', N'Software\Microsoft\MSSQLServer\MSSQLServer', N'DefaultLog', @default_logfolder OUTPUT;
-	
+
+IF (@ProductVersion < '13') -- all versiosn up to 2012
+BEGIN
+    EXEC xp_instance_regread N'HKEY_LOCAL_MACHINE', N'Software\Microsoft\MSSQLServer\MSSQLServer', N'DefaultData', @default_datafolder OUTPUT;
+    EXEC xp_instance_regread N'HKEY_LOCAL_MACHINE', N'Software\Microsoft\MSSQLServer\MSSQLServer', N'DefaultLog', @default_logfolder OUTPUT;
+
+    SET @default_datafolder = @default_datafolder + @FolderSeparator;
+    SET @default_logfolder = @default_logfolder + @FolderSeparator;
+END
+ELSE -- all versions from 2012 R2 onwards
+BEGIN
+    -- these SERVERPROPERTY values are also available in Linux (ver >= 2017)
+    SET @default_datafolder = CAST(SERVERPROPERTY('InstanceDefaultDataPath') AS nvarchar(128));
+    SET @default_logfolder = CAST(SERVERPROPERTY('InstanceDefaultLogPath') AS nvarchar(128));
+END
+
 IF NOT EXISTS (SELECT name FROM sys.databases WHERE name = N'DBAToolbox')
 BEGIN
     PRINT '  Creating database';
@@ -532,295 +551,303 @@ PRINT '';
 -- 008_sqlagent_alerting_mechanism
 PRINT 'Setting SQL Agent Alerting for Developer, Enterprise and Standard Editions only';
 /*
+00. Check whether the OS platform is Windows
 01. Create default Operator
 02. For 2005 and later enable SQL Agent Alert System and set failsafe operator
 03. Create Alerts
 04. Update Alert default Operator
 */
 
--- check Engine Edition
-IF (@EngineEdition LIKE 'Developer%') OR
-   (@EngineEdition LIKE 'Enterprise%') OR
-   (@EngineEdition LIKE 'Business Intelligence%') OR
-   (@EngineEdition LIKE 'Standard%')
+-- check host platform
+IF (@HostPlatform = 'Windows')
 BEGIN
-    CREATE TABLE #AlertInfo (
-	    FailSafeOperator nvarchar(255) NULL,
-	    NotificationMethod int NULL,
-	    ForwardingServer nvarchar(255) NULL,
-	    ForwardingSeverity int NULL,
-	    ForwardAlways int NULL,
-	    PagerToTemplate nvarchar(255) NULL,
-	    PagerCCTemplate nvarchar(255) NULL,
-	    PagerSubjectTemplate nvarchar(255) NULL,
-	    PagerSendSubjectOnly int NULL
-    );
-    INSERT INTO #AlertInfo EXEC sp_MSgetalertinfo;
-
-    /* ******************** */
-    /* ***** OPERATOR ***** */
-    /* ******************** */
-    PRINT '  Creating Operator ' + @AlertOperatorName;
-    IF EXISTS(SELECT name FROM msdb.dbo.sysoperators WHERE name = @AlertOperatorName)
-        -- check if the operator is the fail-safe operator
-        IF NOT EXISTS (SELECT 1 FROM #AlertInfo WHERE FailSafeOperator = @AlertOperatorName)
-            EXEC msdb.dbo.sp_delete_operator @name=@AlertOperatorName
-        ELSE
-            PRINT 'Operator is the fail-safe operator and cannot be deleted';
-
-    IF NOT EXISTS(SELECT name FROM msdb.dbo.sysoperators WHERE name = @AlertOperatorName)
-		EXEC msdb.dbo.sp_add_operator @name=@AlertOperatorName, 
-			@enabled=1, 
-			@weekday_pager_start_time=90000, 
-			@weekday_pager_end_time=180000, 
-			@saturday_pager_start_time=90000, 
-			@saturday_pager_end_time=180000, 
-			@sunday_pager_start_time=90000, 
-			@sunday_pager_end_time=180000, 
-			@pager_days=0, 
-			@email_address=@AlertOperatorEmail, 
-			@category_name=N'[Uncategorized]'
-    ELSE
-        PRINT 'Operator already exists';
-
-
-    /* ******************************** */
-    /* ***** SQL AGENT PROPERTIES ***** */
-    /* ******************************** */
-    -- Enable Mail Profile
-	PRINT '  Enable Mail Profile';
-    EXEC master.dbo.xp_instance_regwrite 
-        N'HKEY_LOCAL_MACHINE', 
-        N'SOFTWARE\Microsoft\MSSQLServer\SQLServerAgent', 
-        N'UseDatabaseMail', 
-        N'REG_DWORD', 1;
-
-    -- Set Mail Profile name
-	PRINT '  Set Mail Profile name';
-    DECLARE @MailProfile nvarchar(256);
-    SET @MailProfile=(SELECT TOP(1) [name] FROM msdb.dbo.sysmail_profile);
-	PRINT '  Mail Profile = ' + @MailProfile;
-    EXEC master.dbo.xp_instance_regwrite 
-        N'HKEY_LOCAL_MACHINE', 
-        N'SOFTWARE\Microsoft\MSSQLServer\SQLServerAgent', 
-        N'DatabaseMailProfile', 
-        N'REG_SZ', 
-        @MailProfile;
-
-    -- Save copies of the sent messages in the Sent Items folder
-    -- Replace tokens for all job responses to alerts
-	PRINT '  Save copies of the sent messages in the Sent Items folder';
-	PRINT '  Replace tokens for all job responses to alerts';
-    EXEC msdb.dbo.sp_set_sqlagent_properties 
-        @email_save_in_sent_folder=1, 
-	    @alert_replace_runtime_tokens=1
-
-    -- Check for Failsafe Operator and set
-	PRINT '  Check for Failsafe Operator and set to "' + @AlertOperatorName + '"';
-    IF NOT EXISTS (SELECT 1 FROM #AlertInfo WHERE FailSafeOperator IS NOT NULL)
+    -- check Engine Edition
+    IF (@EngineEdition LIKE 'Developer%') OR
+    (@EngineEdition LIKE 'Enterprise%') OR
+    (@EngineEdition LIKE 'Business Intelligence%') OR
+    (@EngineEdition LIKE 'Standard%')
     BEGIN
-        EXEC master.dbo.sp_MSsetalertinfo 
-            @failsafeoperator=@AlertOperatorName, 
-            @notificationmethod=1 -- notify using email
-    END
+        CREATE TABLE #AlertInfo (
+            FailSafeOperator nvarchar(255) NULL,
+            NotificationMethod int NULL,
+            ForwardingServer nvarchar(255) NULL,
+            ForwardingSeverity int NULL,
+            ForwardAlways int NULL,
+            PagerToTemplate nvarchar(255) NULL,
+            PagerCCTemplate nvarchar(255) NULL,
+            PagerSubjectTemplate nvarchar(255) NULL,
+            PagerSendSubjectOnly int NULL
+        );
+        INSERT INTO #AlertInfo EXEC sp_MSgetalertinfo;
 
-    DROP TABLE #AlertInfo;
+        /* ******************** */
+        /* ***** OPERATOR ***** */
+        /* ******************** */
+        PRINT '  Creating Operator ' + @AlertOperatorName;
+        IF EXISTS(SELECT name FROM msdb.dbo.sysoperators WHERE name = @AlertOperatorName)
+            -- check if the operator is the fail-safe operator
+            IF NOT EXISTS (SELECT 1 FROM #AlertInfo WHERE FailSafeOperator = @AlertOperatorName)
+                EXEC msdb.dbo.sp_delete_operator @name=@AlertOperatorName
+            ELSE
+                PRINT 'Operator is the fail-safe operator and cannot be deleted';
 
-
-    /* ****************** */
-    /* ***** ALERTS ***** */
-    /* ****************** */
-	PRINT '  Creating Alerts';
-    -- Error 9100 - Index Corruption (2005 and later)
-	PRINT '    Error 9100 - Index Corruption (2005 and later)';
-    IF EXISTS (SELECT name FROM msdb.dbo.sysalerts WHERE name = N'Error 9100 - Index Corruption')
-        EXEC msdb.dbo.sp_delete_alert @name=N'Error 9100 - Index Corruption';
-
-    EXEC msdb.dbo.sp_add_alert @name=N'Error 9100 - Index Corruption', 
-        @message_id=9100, 
-        @severity=0, 
-        @enabled=1, 
-        @include_event_description_in=7,
-        @delay_between_responses=1800, 
-        @category_name=N'[Uncategorized]' ;
-
-    -- Severity 14 - Login failed for user 'sa'
-	PRINT '    Severity 14 - Login failed for user "sa"';
-    IF EXISTS (SELECT name FROM msdb.dbo.sysalerts WHERE name = N'Severity 14 - Login failed for user ''sa''')
-        EXEC msdb.dbo.sp_delete_alert @name=N'Severity 14 - Login failed for user ''sa''';
-
-    EXEC msdb.dbo.sp_add_alert @name=N'Severity 14 - Login failed for user ''sa''', 
-        @message_id=0, 
-        @severity=14, 
-        @enabled=1, 
-        @delay_between_responses=60, 
-        @include_event_description_in=1, 
-        @event_description_keyword=N'Login failed for user ''sa''', 
-        @category_name=N'[Uncategorized]', 
-        @job_id=N'00000000-0000-0000-0000-000000000000';
-
-    -- Severity 17 - Insufficient Resources
-	PRINT '    Severity 17 - Insufficient Resources';
-    IF EXISTS (SELECT name FROM msdb.dbo.sysalerts WHERE name = N'Severity 17 - Insufficient Resources')
-        EXEC msdb.dbo.sp_delete_alert @name=N'Severity 17 - Insufficient Resources';
-
-    EXEC msdb.dbo.sp_add_alert @name=N'Severity 17 - Insufficient Resources', 
-        @message_id=0, 
-        @severity=17, 
-        @enabled=1, 
-        @delay_between_responses=1800, 
-        @include_event_description_in=7;
-
-    -- Severity 19 - Fatal Error in Resource
-	PRINT '    Severity 19 - Fatal Error in Resource';
-    IF EXISTS (SELECT name FROM msdb.dbo.sysalerts WHERE name = N'Severity 19 - Fatal Error in Resource')
-        EXEC msdb.dbo.sp_delete_alert @name=N'Severity 19 - Fatal Error in Resource';
-
-    EXEC msdb.dbo.sp_add_alert @name=N'Severity 19 - Fatal Error in Resource', 
-        @message_id=0, 
-        @severity=19, 
-        @enabled=1, 
-        @delay_between_responses=1800, 
-        @include_event_description_in=7;
-
-    -- Severity 20 - Fatal Error in current process
-	PRINT '    Severity 20 - Fatal Error in current process';
-    IF EXISTS (SELECT name FROM msdb.dbo.sysalerts WHERE name = N'Severity 20 - Fatal Error in current process')
-        EXEC msdb.dbo.sp_delete_alert @name=N'Severity 20 - Fatal Error in current process';
-
-    EXEC msdb.dbo.sp_add_alert @name=N'Severity 20 - Fatal Error in current process', 
-        @message_id=0, 
-        @severity=20, 
-        @enabled=1, 
-        @delay_between_responses=1800, 
-        @include_event_description_in=7;
-
-    -- Severity 21 - Fatal Error in Database Processes
-	PRINT '    Severity 21 - Fatal Error in Database Processes';
-    IF EXISTS (SELECT name FROM msdb.dbo.sysalerts WHERE name = N'Severity 21 - Fatal Error in Database Processes')
-        EXEC msdb.dbo.sp_delete_alert @name=N'Severity 21 - Fatal Error in Database Processes';
-
-    EXEC msdb.dbo.sp_add_alert @name=N'Severity 21 - Fatal Error in Database Processes', 
-        @message_id=0, 
-        @severity=21, 
-        @enabled=1, 
-        @delay_between_responses=1800, 
-        @include_event_description_in=7;
-
-    -- Severity 22 - Fatal Error: Table integrity suspect
-	PRINT '    Severity 22 - Fatal Error: Table integrity suspect';
-    IF EXISTS (SELECT name FROM msdb.dbo.sysalerts WHERE name = N'Severity 22 - Fatal Error: Table integrity suspect')
-        EXEC msdb.dbo.sp_delete_alert @name=N'Severity 22 - Fatal Error: Table integrity suspect';
-
-    EXEC msdb.dbo.sp_add_alert @name=N'Severity 22 - Fatal Error: Table integrity suspect', 
-        @message_id=0, 
-        @severity=22, 
-        @enabled=1, 
-        @delay_between_responses=1800, 
-        @include_event_description_in=7;
-
-    -- Severity 23 - Fatal Error: Database integrity suspect
-	PRINT '    Severity 23 - Fatal Error: Database integrity suspect';
-    IF EXISTS (SELECT name FROM msdb.dbo.sysalerts WHERE name = N'Severity 23 - Fatal Error: Database integrity suspect')
-        EXEC msdb.dbo.sp_delete_alert @name=N'Severity 23 - Fatal Error: Database integrity suspect';
-
-    EXEC msdb.dbo.sp_add_alert @name=N'Severity 23 - Fatal Error: Database integrity suspect', 
-        @message_id=0, 
-        @severity=23, 
-        @enabled=1, 
-        @delay_between_responses=1800, 
-        @include_event_description_in=7;
-
-    -- Severity 24 - Fatal Error: Hardware error
-	PRINT '    Severity 24 - Fatal Error: Hardware error';
-    IF EXISTS (SELECT name FROM msdb.dbo.sysalerts WHERE name = N'Severity 24 - Fatal Error: Hardware error')
-        EXEC msdb.dbo.sp_delete_alert @name=N'Severity 24 - Fatal Error: Hardware error';
-
-    EXEC msdb.dbo.sp_add_alert @name=N'Severity 24 - Fatal Error: Hardware error', 
-        @message_id=0, 
-        @severity=24, 
-        @enabled=1, 
-        @delay_between_responses=1800, 
-        @include_event_description_in=7;
-
-    -- Severity 25 - Fatal Error
-	PRINT '    Severity 25 - Fatal Error';
-    IF EXISTS (SELECT name FROM msdb.dbo.sysalerts WHERE name = N'Severity 25 - Fatal Error')
-        EXEC msdb.dbo.sp_delete_alert @name=N'Severity 25 - Fatal Error';
-
-    EXEC msdb.dbo.sp_add_alert @name=N'Severity 25 - Fatal Error', 
-        @message_id=0, 
-        @severity=25, 
-        @enabled=1, 
-        @delay_between_responses=1800, 
-        @include_event_description_in=7;
+        IF NOT EXISTS(SELECT name FROM msdb.dbo.sysoperators WHERE name = @AlertOperatorName)
+            EXEC msdb.dbo.sp_add_operator @name=@AlertOperatorName, 
+                @enabled=1, 
+                @weekday_pager_start_time=90000, 
+                @weekday_pager_end_time=180000, 
+                @saturday_pager_start_time=90000, 
+                @saturday_pager_end_time=180000, 
+                @sunday_pager_start_time=90000, 
+                @sunday_pager_end_time=180000, 
+                @pager_days=0, 
+                @email_address=@AlertOperatorEmail, 
+                @category_name=N'[Uncategorized]'
+        ELSE
+            PRINT 'Operator already exists';
 
 
-    /* ************************* */
-    /* ***** NOTIFICATIONS ***** */
-    /* ************************* */
-	PRINT '  Create Notifications';
-	PRINT '    Error 9100 - Index Corruption';
-    EXEC msdb.dbo.sp_add_notification 
-        @alert_name=N'Error 9100 - Index Corruption', 
-        @operator_name=@AlertOperatorName, 
-        @notification_method = 1;
+        /* ******************************** */
+        /* ***** SQL AGENT PROPERTIES ***** */
+        /* ******************************** */
+        -- Enable Mail Profile
+        PRINT '  Enable Mail Profile';
+        EXEC master.dbo.xp_instance_regwrite 
+            N'HKEY_LOCAL_MACHINE', 
+            N'SOFTWARE\Microsoft\MSSQLServer\SQLServerAgent', 
+            N'UseDatabaseMail', 
+            N'REG_DWORD', 1;
 
-    PRINT '    Severity 14 - Login failed for user "sa"';
-	EXEC msdb.dbo.sp_add_notification 
-        @alert_name=N'Severity 14 - Login failed for user ''sa''', 
-        @operator_name=@AlertOperatorName, 
-        @notification_method = 1;
+        -- Set Mail Profile name
+        PRINT '  Set Mail Profile name';
+        DECLARE @MailProfile nvarchar(256);
+        SET @MailProfile=(SELECT TOP(1) [name] FROM msdb.dbo.sysmail_profile);
+        PRINT '  Mail Profile = ' + @MailProfile;
+        EXEC master.dbo.xp_instance_regwrite 
+            N'HKEY_LOCAL_MACHINE', 
+            N'SOFTWARE\Microsoft\MSSQLServer\SQLServerAgent', 
+            N'DatabaseMailProfile', 
+            N'REG_SZ', 
+            @MailProfile;
 
-    PRINT '    Severity 17 - Insufficient Resources';
-	EXEC msdb.dbo.sp_add_notification 
-        @alert_name=N'Severity 17 - Insufficient Resources', 
-        @operator_name=@AlertOperatorName, 
-        @notification_method = 1;
+        -- Save copies of the sent messages in the Sent Items folder
+        -- Replace tokens for all job responses to alerts
+        PRINT '  Save copies of the sent messages in the Sent Items folder';
+        PRINT '  Replace tokens for all job responses to alerts';
+        EXEC msdb.dbo.sp_set_sqlagent_properties 
+            @email_save_in_sent_folder=1, 
+            @alert_replace_runtime_tokens=1
 
-    PRINT '    Severity 19 - Fatal Error in Resource';
-	EXEC msdb.dbo.sp_add_notification 
-        @alert_name=N'Severity 19 - Fatal Error in Resource', 
-        @operator_name=@AlertOperatorName, 
-        @notification_method = 1;
+        -- Check for Failsafe Operator and set
+        PRINT '  Check for Failsafe Operator and set to "' + @AlertOperatorName + '"';
+        IF NOT EXISTS (SELECT 1 FROM #AlertInfo WHERE FailSafeOperator IS NOT NULL)
+        BEGIN
+            EXEC master.dbo.sp_MSsetalertinfo 
+                @failsafeoperator=@AlertOperatorName, 
+                @notificationmethod=1 -- notify using email
+        END
 
-    PRINT '    Severity 20 - Fatal Error in current process';
-	EXEC msdb.dbo.sp_add_notification 
-        @alert_name=N'Severity 20 - Fatal Error in current process', 
-        @operator_name=@AlertOperatorName, 
-        @notification_method = 1;
+        DROP TABLE #AlertInfo;
 
-    PRINT '    Severity 21 - Fatal Error in Database Processes';
-	EXEC msdb.dbo.sp_add_notification 
-        @alert_name=N'Severity 21 - Fatal Error in Database Processes', 
-        @operator_name=@AlertOperatorName, 
-        @notification_method = 1;
 
-    PRINT '    Severity 22 - Fatal Error: Table integrity suspect';
-	EXEC msdb.dbo.sp_add_notification 
-        @alert_name=N'Severity 22 - Fatal Error: Table integrity suspect', 
-        @operator_name=@AlertOperatorName, 
-        @notification_method = 1;
+        /* ****************** */
+        /* ***** ALERTS ***** */
+        /* ****************** */
+        PRINT '  Creating Alerts';
+        -- Error 9100 - Index Corruption (2005 and later)
+        PRINT '    Error 9100 - Index Corruption (2005 and later)';
+        IF EXISTS (SELECT name FROM msdb.dbo.sysalerts WHERE name = N'Error 9100 - Index Corruption')
+            EXEC msdb.dbo.sp_delete_alert @name=N'Error 9100 - Index Corruption';
 
-    PRINT '    Severity 23 - Fatal Error: Database integrity suspect';
-	EXEC msdb.dbo.sp_add_notification 
-        @alert_name=N'Severity 23 - Fatal Error: Database integrity suspect', 
-        @operator_name=@AlertOperatorName, 
-        @notification_method = 1;
+        EXEC msdb.dbo.sp_add_alert @name=N'Error 9100 - Index Corruption', 
+            @message_id=9100, 
+            @severity=0, 
+            @enabled=1, 
+            @include_event_description_in=7,
+            @delay_between_responses=1800, 
+            @category_name=N'[Uncategorized]' ;
 
-    PRINT '    Severity 24 - Fatal Error: Hardware error';
-	EXEC msdb.dbo.sp_add_notification 
-        @alert_name=N'Severity 24 - Fatal Error: Hardware error', 
-        @operator_name=@AlertOperatorName, 
-        @notification_method = 1;
+        -- Severity 14 - Login failed for user 'sa'
+        PRINT '    Severity 14 - Login failed for user "sa"';
+        IF EXISTS (SELECT name FROM msdb.dbo.sysalerts WHERE name = N'Severity 14 - Login failed for user ''sa''')
+            EXEC msdb.dbo.sp_delete_alert @name=N'Severity 14 - Login failed for user ''sa''';
 
-    PRINT '    Severity 25 - Fatal Error';
-	EXEC msdb.dbo.sp_add_notification 
-        @alert_name=N'Severity 25 - Fatal Error', 
-        @operator_name=@AlertOperatorName, 
-        @notification_method = 1;
+        EXEC msdb.dbo.sp_add_alert @name=N'Severity 14 - Login failed for user ''sa''', 
+            @message_id=0, 
+            @severity=14, 
+            @enabled=1, 
+            @delay_between_responses=60, 
+            @include_event_description_in=1, 
+            @event_description_keyword=N'Login failed for user ''sa''', 
+            @category_name=N'[Uncategorized]', 
+            @job_id=N'00000000-0000-0000-0000-000000000000';
 
-END -- check Engine Edition
+        -- Severity 17 - Insufficient Resources
+        PRINT '    Severity 17 - Insufficient Resources';
+        IF EXISTS (SELECT name FROM msdb.dbo.sysalerts WHERE name = N'Severity 17 - Insufficient Resources')
+            EXEC msdb.dbo.sp_delete_alert @name=N'Severity 17 - Insufficient Resources';
+
+        EXEC msdb.dbo.sp_add_alert @name=N'Severity 17 - Insufficient Resources', 
+            @message_id=0, 
+            @severity=17, 
+            @enabled=1, 
+            @delay_between_responses=1800, 
+            @include_event_description_in=7;
+
+        -- Severity 19 - Fatal Error in Resource
+        PRINT '    Severity 19 - Fatal Error in Resource';
+        IF EXISTS (SELECT name FROM msdb.dbo.sysalerts WHERE name = N'Severity 19 - Fatal Error in Resource')
+            EXEC msdb.dbo.sp_delete_alert @name=N'Severity 19 - Fatal Error in Resource';
+
+        EXEC msdb.dbo.sp_add_alert @name=N'Severity 19 - Fatal Error in Resource', 
+            @message_id=0, 
+            @severity=19, 
+            @enabled=1, 
+            @delay_between_responses=1800, 
+            @include_event_description_in=7;
+
+        -- Severity 20 - Fatal Error in current process
+        PRINT '    Severity 20 - Fatal Error in current process';
+        IF EXISTS (SELECT name FROM msdb.dbo.sysalerts WHERE name = N'Severity 20 - Fatal Error in current process')
+            EXEC msdb.dbo.sp_delete_alert @name=N'Severity 20 - Fatal Error in current process';
+
+        EXEC msdb.dbo.sp_add_alert @name=N'Severity 20 - Fatal Error in current process', 
+            @message_id=0, 
+            @severity=20, 
+            @enabled=1, 
+            @delay_between_responses=1800, 
+            @include_event_description_in=7;
+
+        -- Severity 21 - Fatal Error in Database Processes
+        PRINT '    Severity 21 - Fatal Error in Database Processes';
+        IF EXISTS (SELECT name FROM msdb.dbo.sysalerts WHERE name = N'Severity 21 - Fatal Error in Database Processes')
+            EXEC msdb.dbo.sp_delete_alert @name=N'Severity 21 - Fatal Error in Database Processes';
+
+        EXEC msdb.dbo.sp_add_alert @name=N'Severity 21 - Fatal Error in Database Processes', 
+            @message_id=0, 
+            @severity=21, 
+            @enabled=1, 
+            @delay_between_responses=1800, 
+            @include_event_description_in=7;
+
+        -- Severity 22 - Fatal Error: Table integrity suspect
+        PRINT '    Severity 22 - Fatal Error: Table integrity suspect';
+        IF EXISTS (SELECT name FROM msdb.dbo.sysalerts WHERE name = N'Severity 22 - Fatal Error: Table integrity suspect')
+            EXEC msdb.dbo.sp_delete_alert @name=N'Severity 22 - Fatal Error: Table integrity suspect';
+
+        EXEC msdb.dbo.sp_add_alert @name=N'Severity 22 - Fatal Error: Table integrity suspect', 
+            @message_id=0, 
+            @severity=22, 
+            @enabled=1, 
+            @delay_between_responses=1800, 
+            @include_event_description_in=7;
+
+        -- Severity 23 - Fatal Error: Database integrity suspect
+        PRINT '    Severity 23 - Fatal Error: Database integrity suspect';
+        IF EXISTS (SELECT name FROM msdb.dbo.sysalerts WHERE name = N'Severity 23 - Fatal Error: Database integrity suspect')
+            EXEC msdb.dbo.sp_delete_alert @name=N'Severity 23 - Fatal Error: Database integrity suspect';
+
+        EXEC msdb.dbo.sp_add_alert @name=N'Severity 23 - Fatal Error: Database integrity suspect', 
+            @message_id=0, 
+            @severity=23, 
+            @enabled=1, 
+            @delay_between_responses=1800, 
+            @include_event_description_in=7;
+
+        -- Severity 24 - Fatal Error: Hardware error
+        PRINT '    Severity 24 - Fatal Error: Hardware error';
+        IF EXISTS (SELECT name FROM msdb.dbo.sysalerts WHERE name = N'Severity 24 - Fatal Error: Hardware error')
+            EXEC msdb.dbo.sp_delete_alert @name=N'Severity 24 - Fatal Error: Hardware error';
+
+        EXEC msdb.dbo.sp_add_alert @name=N'Severity 24 - Fatal Error: Hardware error', 
+            @message_id=0, 
+            @severity=24, 
+            @enabled=1, 
+            @delay_between_responses=1800, 
+            @include_event_description_in=7;
+
+        -- Severity 25 - Fatal Error
+        PRINT '    Severity 25 - Fatal Error';
+        IF EXISTS (SELECT name FROM msdb.dbo.sysalerts WHERE name = N'Severity 25 - Fatal Error')
+            EXEC msdb.dbo.sp_delete_alert @name=N'Severity 25 - Fatal Error';
+
+        EXEC msdb.dbo.sp_add_alert @name=N'Severity 25 - Fatal Error', 
+            @message_id=0, 
+            @severity=25, 
+            @enabled=1, 
+            @delay_between_responses=1800, 
+            @include_event_description_in=7;
+
+
+        /* ************************* */
+        /* ***** NOTIFICATIONS ***** */
+        /* ************************* */
+        PRINT '  Create Notifications';
+        PRINT '    Error 9100 - Index Corruption';
+        EXEC msdb.dbo.sp_add_notification 
+            @alert_name=N'Error 9100 - Index Corruption', 
+            @operator_name=@AlertOperatorName, 
+            @notification_method = 1;
+
+        PRINT '    Severity 14 - Login failed for user "sa"';
+        EXEC msdb.dbo.sp_add_notification 
+            @alert_name=N'Severity 14 - Login failed for user ''sa''', 
+            @operator_name=@AlertOperatorName, 
+            @notification_method = 1;
+
+        PRINT '    Severity 17 - Insufficient Resources';
+        EXEC msdb.dbo.sp_add_notification 
+            @alert_name=N'Severity 17 - Insufficient Resources', 
+            @operator_name=@AlertOperatorName, 
+            @notification_method = 1;
+
+        PRINT '    Severity 19 - Fatal Error in Resource';
+        EXEC msdb.dbo.sp_add_notification 
+            @alert_name=N'Severity 19 - Fatal Error in Resource', 
+            @operator_name=@AlertOperatorName, 
+            @notification_method = 1;
+
+        PRINT '    Severity 20 - Fatal Error in current process';
+        EXEC msdb.dbo.sp_add_notification 
+            @alert_name=N'Severity 20 - Fatal Error in current process', 
+            @operator_name=@AlertOperatorName, 
+            @notification_method = 1;
+
+        PRINT '    Severity 21 - Fatal Error in Database Processes';
+        EXEC msdb.dbo.sp_add_notification 
+            @alert_name=N'Severity 21 - Fatal Error in Database Processes', 
+            @operator_name=@AlertOperatorName, 
+            @notification_method = 1;
+
+        PRINT '    Severity 22 - Fatal Error: Table integrity suspect';
+        EXEC msdb.dbo.sp_add_notification 
+            @alert_name=N'Severity 22 - Fatal Error: Table integrity suspect', 
+            @operator_name=@AlertOperatorName, 
+            @notification_method = 1;
+
+        PRINT '    Severity 23 - Fatal Error: Database integrity suspect';
+        EXEC msdb.dbo.sp_add_notification 
+            @alert_name=N'Severity 23 - Fatal Error: Database integrity suspect', 
+            @operator_name=@AlertOperatorName, 
+            @notification_method = 1;
+
+        PRINT '    Severity 24 - Fatal Error: Hardware error';
+        EXEC msdb.dbo.sp_add_notification 
+            @alert_name=N'Severity 24 - Fatal Error: Hardware error', 
+            @operator_name=@AlertOperatorName, 
+            @notification_method = 1;
+
+        PRINT '    Severity 25 - Fatal Error';
+        EXEC msdb.dbo.sp_add_notification 
+            @alert_name=N'Severity 25 - Fatal Error', 
+            @operator_name=@AlertOperatorName, 
+            @notification_method = 1;
+
+    END -- check Engine Edition
+
+END -- check host platform
+ELSE
+    PRINT '  SQL Agent functionality not available/supported on ' + @HostPlatform
 
 PRINT ''
 
@@ -1323,7 +1350,7 @@ END
 ELSE
 BEGIN
 	-- syntax for 2012 and later versions
-	IF ((@IsClustered = 0) AND (@IsHadrEnabled = 0)) -- only if not clustered - login is used as the Cluster Service start-up account
+	IF ((@IsClustered = 0) AND (@IsHadrEnabled = 0)) -- only if not clustered - login is used as the Cluster Service start-up account and by Always On Availability Groups
     BEGIN
         PRINT '  Revoke membership to "NT AUTHORITY\SYSTEM"';
 	    IF (((SELECT TOP(1) 1 FROM sys.server_principals WHERE [name] = 'NT AUTHORITY\SYSTEM') = 1) AND (IS_SRVROLEMEMBER('sysadmin', 'NT AUTHORITY\SYSTEM') = 1))
@@ -1339,7 +1366,7 @@ BEGIN
 		EXEC sp_executesql N'USE [master];ALTER SERVER ROLE [sysadmin] DROP MEMBER [NT SERVICE\Winmgmt]';
 
 	PRINT '  Disable these accounts'
-	IF ((@IsClustered = 0) AND (@IsHadrEnabled = 0)) -- only if not clustered - login is used as the Cluster Service start-up account
+	IF ((@IsClustered = 0) AND (@IsHadrEnabled = 0)) -- only if not clustered - login is used as the Cluster Service start-up account and by Always On Availability Groups
     BEGIN
         IF EXISTS(SELECT 1 FROM sys.server_principals WHERE [name] = 'NT AUTHORITY\SYSTEM')
             ALTER LOGIN [NT AUTHORITY\SYSTEM] DISABLE;
