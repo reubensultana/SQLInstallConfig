@@ -1382,9 +1382,19 @@ PRINT '';
 /* ************************************************** */
 -- 013_optimize_for_workloads
 PRINT 'Enable the ''optimize for ad hoc workloads'' option';
-IF EXISTS (SELECT 1 FROM sys.configurations WHERE [name] = 'show advanced options' AND CAST([value] AS int) = 0)
+IF EXISTS (SELECT 1 FROM sys.configurations WHERE [name] = 'optimize for ad hoc workloads' AND CAST([value] AS int) = 0)
 BEGIN
 	EXEC sys.sp_configure 'optimize for ad hoc workloads', 1;
+	RECONFIGURE WITH OVERRIDE;
+END
+PRINT '';
+
+/* ************************************************** */
+-- 014_cost_threshold_for_parallelism
+PRINT 'Enable the ''cost threshold for parallelism'' option';
+IF EXISTS (SELECT 1 FROM sys.configurations WHERE [name] = 'cost threshold for parallelism' AND CAST([value] AS int) < 50)
+BEGIN
+	EXEC sys.sp_configure N'cost threshold for parallelism', N'50'
 	RECONFIGURE WITH OVERRIDE;
 END
 PRINT '';
